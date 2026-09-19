@@ -1,0 +1,18 @@
+rollout:
+  enabled: true
+  autoPromotionEnabled: false
+cluster:
+  name: cluster-nonprod
+backend:
+  image:
+    repository: 123456789012.dkr.ecr.us-east-1.amazonaws.com/nonprod/hotel-backend
+    tag: sha-example
+    digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+frontend:
+  image:
+    repository: 123456789012.dkr.ecr.us-east-1.amazonaws.com/nonprod/hotel-frontend
+    tag: sha-example
+    digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+platform:
+  ingress:
+    host: hotel-staging.example.internal

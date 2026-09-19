@@ -1,0 +1,238 @@
+# Reusable: branch + YAML update + Pull Request against gitops-platform.
+# Never push directly to gitops-platform main.
+name: GitOps PR
+
+on:
+  workflow_call:
+    inputs:
+      application:
+        required: true
+        type: string
+      mode:
+        required: true
+        type: string
+        description: apply-release | promote-env | promote-traffic
+      environment:
+        required: false
+        type: string
+        default: dev
+      source:
+        required: false
+        type: string
+        default: ""
+      target:
+        required: false
+        type: string
+        default: ""
+      emergency:
+        required: false
+        type: boolean
+        default: false
+      auto_merge:
+        required: false
+        type: boolean
+        default: false
+      backend_repository:
+        required: false
+        type: string
+        default: ""
+      backend_tag:
+        required: false
+        type: string
+        default: ""
+      backend_digest:
+        required: false
+        type: string
+        default: ""
+      frontend_repository:
+        required: false
+        type: string
+        default: ""
+      frontend_tag:
+        required: false
+        type: string
+        default: ""
+      frontend_digest:
+        required: false
+        type: string
+        default: ""
+      repository:
+        required: false
+        type: string
+        default: ""
+      tag:
+        required: false
+        type: string
+        default: ""
+      digest:
+        required: false
+        type: string
+        default: ""
+      gitops_owner:
+        required: true
+        type: string
+        description: GitHub owner of the GitOps values repository
+      gitops_repository:
+        required: true
+        type: string
+        description: GitOps values repository name (no owner prefix)
+    secrets:
+      GITOPS_PAT:
+        required: false
+      GITOPS_APP_ID:
+        required: false
+      GITOPS_APP_PRIVATE_KEY:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  gitops-pr:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: gitops-${{ inputs.application }}-${{ inputs.target || inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - name: GitHub App or PAT token
+        id: tok
+        uses: actions/create-github-app-token@v2
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.GITOPS_APP_ID }}
+          private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
+          owner: ${{ inputs.gitops_owner }}
+          repositories: ${{ inputs.gitops_repository }}
+
+      - name: Resolve token
+        id: auth
+        run: |
+          if [[ -n "${{ steps.tok.outputs.token }}" ]]; then
+            echo "token=${{ steps.tok.outputs.token }}" >> "$GITHUB_OUTPUT"
+            echo "auth=github-app" >> "$GITHUB_OUTPUT"
+          elif [[ -n "${{ secrets.GITOPS_PAT }}" ]]; then
+            echo "token=${{ secrets.GITOPS_PAT }}" >> "$GITHUB_OUTPUT"
+            echo "auth=pat-fallback" >> "$GITHUB_OUTPUT"
+            echo "::warning::GITOPS_PAT fallback in use. Replace with GitHub App (see docs/cicd-standard/gitops-pr-model.md)."
+          else
+            echo "::error::Need GITOPS_APP_ID/GITOPS_APP_PRIVATE_KEY or temporary GITOPS_PAT"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          path: wf
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.gitops_owner }}/${{ inputs.gitops_repository }}
+          token: ${{ steps.auth.outputs.token }}
+          path: gitops
+
+      - name: Install PyYAML
+        run: pip install --quiet pyyaml
+
+      - name: Copy digest between ECR repos (production only)
+        if: inputs.mode == 'promote-env' && inputs.target == 'production'
+        env:
+          AWS_REGION: us-east-1
+        run: |
+          echo "ECR digest copy runs in the caller workflow before this job when AWS is configured."
+          echo "This job only rewrites GitOps YAML (prod registry prefix)."
+
+      - name: Update values
+        working-directory: gitops
+        env:
+          APP: ${{ inputs.application }}
+          MODE: ${{ inputs.mode }}
+          ENV_NAME: ${{ inputs.environment }}
+          SOURCE: ${{ inputs.source }}
+          TARGET: ${{ inputs.target }}
+          EMERGENCY: ${{ inputs.emergency }}
+          SCRIPT: ${{ github.workspace }}/wf/scripts/gitops-update.py
+        run: |
+          set -euo pipefail
+          if [[ "$MODE" == "apply-release" ]]; then
+            if [[ "$APP" == "hotel" ]]; then
+              python3 "$SCRIPT" apply-release --application hotel --environment "$ENV_NAME" \
+                --backend-repository "${{ inputs.backend_repository }}" \
+                --backend-tag "${{ inputs.backend_tag }}" \
+                --backend-digest "${{ inputs.backend_digest }}" \
+                --frontend-repository "${{ inputs.frontend_repository }}" \
+                --frontend-tag "${{ inputs.frontend_tag }}" \
+                --frontend-digest "${{ inputs.frontend_digest }}"
+            else
+              python3 "$SCRIPT" apply-release --application erpnext --environment "$ENV_NAME" \
+                --repository "${{ inputs.repository }}" \
+                --tag "${{ inputs.tag }}" \
+                --digest "${{ inputs.digest }}"
+            fi
+          elif [[ "$MODE" == "promote-env" ]]; then
+            extra=""
+            [[ "$EMERGENCY" == "true" ]] && extra="--emergency"
+            python3 "$SCRIPT" promote-env --application "$APP" --source "$SOURCE" --target "$TARGET" $extra
+          elif [[ "$MODE" == "promote-traffic" ]]; then
+            python3 "$SCRIPT" promote-traffic --application hotel --environment "$ENV_NAME"
+          else
+            echo "unknown mode $MODE" >&2
+            exit 1
+          fi
+
+      - name: Create Pull Request
+        env:
+          GH_TOKEN: ${{ steps.auth.outputs.token }}
+          APP: ${{ inputs.application }}
+          MODE: ${{ inputs.mode }}
+          ENV_NAME: ${{ inputs.environment }}
+          SOURCE: ${{ inputs.source }}
+          TARGET: ${{ inputs.target }}
+          AUTO: ${{ inputs.auto_merge }}
+          SHA: ${{ github.sha }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          AUTH: ${{ steps.auth.outputs.auth }}
+        working-directory: gitops
+        run: |
+          set -euo pipefail
+          DEST="${TARGET:-$ENV_NAME}"
+          BRANCH="promote/${APP}/${DEST}/${SHA:0:12}"
+          git config user.name "gitops-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No GitOps changes"
+            exit 0
+          fi
+          git commit -m "promote(${APP}): ${SOURCE:-build} → ${DEST} (${SHA:0:12})"
+          git push -u origin "$BRANCH"
+          BODY=$(cat <<EOF
+          Application: ${APP}
+          Component: artifact set
+          Git SHA: ${SHA}
+          Image Tag: (see diff)
+          Image Digest: (see diff)
+          Source Environment: ${SOURCE:-build}
+          Target Environment: ${DEST}
+          CI Run: ${RUN}
+          Auth: ${AUTH}
+
+          Build-once / promote-many. No image rebuild.
+
+          UAT note: infrastructure (DNS / Secrets Manager) may not exist yet.
+
+          Production PRs are GitOps-only; operators must review before merge.
+          EOF
+          )
+          PR_ARGS=(--title "promote(${APP}): ${SOURCE:-build} → ${DEST}" --body "$BODY" --base main --head "$BRANCH")
+          if [[ "$DEST" == "production" ]]; then
+            echo "Production PRs are never auto-merged."
+            AUTO=false
+          fi
+          if [[ "$DEST" == "uat" ]]; then
+            BODY="${BODY}"$'\n\n'"WARNING: UAT infrastructure dependencies may not exist yet."
+          fi
+          url=$(gh pr create "${PR_ARGS[@]}")
+          echo "PR=$url"
+          if [[ "$AUTO" == "true" && "$DEST" == "dev" ]]; then
+            gh pr merge --auto --squash "$url" || echo "::warning::auto-merge not enabled; operator must merge $url"
+          fi

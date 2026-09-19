@@ -1,0 +1,228 @@
+# Reusable: build one container, Trivy, optional ECR push + SBOM + Cosign.
+# Image is environment-neutral. Do not bake environment names.
+# Signing runs only when inputs.push=true (trusted refs). Fork PRs must keep push: false.
+# Private key is AWS Secrets Manager platform/cosign-signing (raw PEM). Never echo it.
+name: Container CI
+
+on:
+  workflow_call:
+    inputs:
+      application:
+        required: true
+        type: string
+      component:
+        required: true
+        type: string
+      dockerfile:
+        required: true
+        type: string
+      context:
+        required: true
+        type: string
+      ecr_repository:
+        required: true
+        type: string
+      aws_region:
+        required: false
+        type: string
+        default: us-east-1
+      image_tag:
+        required: false
+        type: string
+        default: ""
+      push:
+        required: false
+        type: boolean
+        default: false
+      build_args:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      AWS_ROLE_ARN:
+        required: false
+    outputs:
+      image_repository:
+        description: Registry/repo without digest
+        value: ${{ jobs.build.outputs.image_repository }}
+      image_tag:
+        value: ${{ jobs.build.outputs.image_tag }}
+      image_digest:
+        value: ${{ jobs.build.outputs.image_digest }}
+      image_uri:
+        value: ${{ jobs.build.outputs.image_uri }}
+      git_sha:
+        value: ${{ jobs.build.outputs.git_sha }}
+
+permissions:
+  contents: read
+  id-token: write
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image_repository: ${{ steps.meta.outputs.image_repository }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_digest: ${{ steps.meta.outputs.image_digest }}
+      image_uri: ${{ steps.meta.outputs.image_uri }}
+      git_sha: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Tag
+        id: tag
+        run: |
+          TAG="${{ inputs.image_tag }}"
+          if [[ -z "$TAG" ]]; then
+            TAG="sha-${GITHUB_SHA}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+      - name: Build image
+        uses: docker/build-push-action@471d1dc4e07e5cdedd4c2171150001c434f0b7a4 # v6.15.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          load: true
+          push: false
+          tags: local/${{ inputs.component }}:${{ steps.tag.outputs.tag }}
+          build-args: ${{ inputs.build_args }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp || github.event.pull_request.updated_at }}
+            org.opencontainers.image.title=${{ inputs.application }}-${{ inputs.component }}
+
+      - name: Trivy CRITICAL (fail)
+        uses: aquasecurity/trivy-action@915b19bbe73b92a6cf82a1bc12b087c9a19a5fe2 # v0.28.0
+        with:
+          image-ref: local/${{ inputs.component }}:${{ steps.tag.outputs.tag }}
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Trivy HIGH report
+        uses: aquasecurity/trivy-action@915b19bbe73b92a6cf82a1bc12b087c9a19a5fe2 # v0.28.0
+        with:
+          image-ref: local/${{ inputs.component }}:${{ steps.tag.outputs.tag }}
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+          ignore-unfixed: true
+
+      - name: Configure AWS (push only)
+        if: inputs.push
+        uses: aws-actions/configure-aws-credentials@ececac1a45f3b08a01d2dd070d28d111c5fe6722 # v4.1.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: ${{ inputs.application }}-${{ inputs.component }}-${{ github.run_id }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Login ECR (push only)
+        if: inputs.push
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+
+      - name: Push and capture digest
+        id: meta
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          LOCAL="local/${{ inputs.component }}:${TAG}"
+          echo "image_tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "git_sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          if [[ "${{ inputs.push }}" != "true" ]]; then
+            echo "image_repository=local/${{ inputs.component }}" >> "$GITHUB_OUTPUT"
+            echo "image_digest=" >> "$GITHUB_OUTPUT"
+            echo "image_uri=local/${{ inputs.component }}:${TAG}" >> "$GITHUB_OUTPUT"
+            echo "PR/build-only: not pushing to ECR, not signing"
+            exit 0
+          fi
+          REG="${{ steps.ecr.outputs.registry }}"
+          REPO="${REG}/${{ inputs.ecr_repository }}"
+          docker tag "$LOCAL" "${REPO}:${TAG}"
+          DIGEST="$(docker push "${REPO}:${TAG}" | awk '/digest: sha256:/{print $3}')"
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            DIGEST="$(docker image inspect --format '{{index .RepoDigests 0}}' "${REPO}:${TAG}")"
+            DIGEST="${DIGEST#*@}"
+          fi
+          echo "image_repository=${REPO}" >> "$GITHUB_OUTPUT"
+          echo "image_digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "image_uri=${REPO}@${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_REPOSITORY=${REPO}"
+          echo "IMAGE_TAG=${TAG}"
+          echo "IMAGE_DIGEST=${DIGEST}"
+          echo "IMAGE_URI=${REPO}@${DIGEST}"
+
+      - name: SBOM (SPDX JSON)
+        if: inputs.push
+        uses: aquasecurity/trivy-action@915b19bbe73b92a6cf82a1bc12b087c9a19a5fe2 # v0.28.0
+        with:
+          image-ref: ${{ steps.meta.outputs.image_uri }}
+          format: spdx-json
+          output: sbom-${{ inputs.component }}.spdx.json
+          exit-code: "0"
+
+      - name: Upload SBOM
+        if: inputs.push
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom-${{ inputs.application }}-${{ inputs.component }}
+          path: sbom-${{ inputs.component }}.spdx.json
+          if-no-files-found: warn
+
+      - name: Install Cosign
+        if: inputs.push
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
+
+      - name: Attest SBOM + provenance, then sign digest
+        if: inputs.push
+        env:
+          COSIGN_PASSWORD: ""
+          IMAGE_REPOSITORY: ${{ steps.meta.outputs.image_repository }}
+          IMAGE_DIGEST: ${{ steps.meta.outputs.image_digest }}
+          COMPONENT: ${{ inputs.component }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "digest missing; refusing to sign"
+            exit 1
+          fi
+          umask 077
+          KEYFILE="$(mktemp)"
+          PROV="provenance-${COMPONENT}.json"
+          cleanup() { rm -f "$KEYFILE" "$PROV"; }
+          trap cleanup EXIT
+          aws secretsmanager get-secret-value \
+            --secret-id platform/cosign-signing \
+            --query SecretString \
+            --output text > "$KEYFILE"
+          python3 -c 'import json,os,sys
+pred={
+  "builder":{"id":os.environ["GITHUB_SERVER_URL"]+"/"+os.environ["GITHUB_REPOSITORY"]+"/actions"},
+  "buildType":"https://github.com/actions/runner",
+  "invocation":{
+    "configSource":{
+      "uri":"git+"+os.environ["GITHUB_SERVER_URL"]+"/"+os.environ["GITHUB_REPOSITORY"],
+      "digest":{"sha1":os.environ["GITHUB_SHA"]},
+      "entryPoint":os.environ.get("GITHUB_WORKFLOW",""),
+    },
+    "parameters":{"run_id":os.environ.get("GITHUB_RUN_ID","")},
+  },
+  "metadata":{
+    "buildInvocationId":os.environ["GITHUB_SERVER_URL"]+"/"+os.environ["GITHUB_REPOSITORY"]+"/actions/runs/"+os.environ.get("GITHUB_RUN_ID",""),
+    "completeness":{"parameters":True,"environment":False,"materials":False},
+  },
+  "materials":[{"uri":"git+"+os.environ["GITHUB_SERVER_URL"]+"/"+os.environ["GITHUB_REPOSITORY"],"digest":{"sha1":os.environ["GITHUB_SHA"]}}],
+}
+open(sys.argv[1],"w").write(json.dumps(pred))' "$PROV"
+          IMAGE="${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
+          # Order: SBOM attest → provenance attest → sign digest. Fail closed: unsigned must not be promoted.
+          cosign attest --key "$KEYFILE" --tlog-upload=false --type spdxjson \
+            --predicate "sbom-${COMPONENT}.spdx.json" "$IMAGE"
+          cosign attest --key "$KEYFILE" --tlog-upload=false --type slsaprovenance \
+            --predicate "$PROV" "$IMAGE"
+          cosign sign --key "$KEYFILE" --tlog-upload=false "$IMAGE"
+          echo "signed digest ${IMAGE_DIGEST}"

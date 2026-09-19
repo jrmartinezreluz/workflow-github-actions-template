@@ -1,0 +1,15 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+kubeconfig*
+credentials*
+__pycache__/
+*.pyc
+.venv/
+*.tgz
+!**/charts/**/*.tgz

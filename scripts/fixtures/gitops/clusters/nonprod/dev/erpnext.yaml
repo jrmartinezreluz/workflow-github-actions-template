@@ -1,0 +1,10 @@
+cluster:
+  name: cluster-nonprod
+erpnext:
+  image:
+    repository: 123456789012.dkr.ecr.us-east-1.amazonaws.com/nonprod/erpnext
+    tag: sha-example
+    digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+platform:
+  ingress:
+    host: erpnext-dev.example.internal

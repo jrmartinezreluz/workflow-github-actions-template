@@ -1,0 +1,47 @@
+# Callable promotion orchestrator (digest copy, no rebuild).
+name: Promote GitOps
+
+on:
+  workflow_call:
+    inputs:
+      application:
+        required: true
+        type: string
+      source:
+        required: true
+        type: string
+      target:
+        required: true
+        type: string
+      emergency:
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      GITOPS_PAT:
+        required: false
+      GITOPS_APP_ID:
+        required: false
+      GITOPS_APP_PRIVATE_KEY:
+        required: false
+      AWS_ROLE_ARN:
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  promote:
+    uses: ./.github/workflows/reusable-gitops-pr.yml
+    with:
+      application: ${{ inputs.application }}
+      mode: promote-env
+      source: ${{ inputs.source }}
+      target: ${{ inputs.target }}
+      emergency: ${{ inputs.emergency }}
+      auto_merge: ${{ inputs.target == 'dev' }}
+    secrets:
+      GITOPS_PAT: ${{ secrets.GITOPS_PAT }}
+      GITOPS_APP_ID: ${{ secrets.GITOPS_APP_ID }}
+      GITOPS_APP_PRIVATE_KEY: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}

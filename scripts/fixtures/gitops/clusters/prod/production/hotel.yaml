@@ -1,0 +1,18 @@
+rollout:
+  enabled: true
+  autoPromotionEnabled: false
+cluster:
+  name: cluster-prod
+backend:
+  image:
+    repository: 123456789012.dkr.ecr.us-east-1.amazonaws.com/prod/hotel-backend
+    tag: sha-example
+    digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+frontend:
+  image:
+    repository: 123456789012.dkr.ecr.us-east-1.amazonaws.com/prod/hotel-frontend
+    tag: sha-example
+    digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+platform:
+  ingress:
+    host: hotel.example.internal
